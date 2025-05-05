@@ -29,7 +29,7 @@ async fn chat(req: Request) -> Response {
     let (responses, idx) = join!(messages, idx);
     let (responses, idx) = (responses.unwrap(), idx.unwrap());
 
-    let new_message = responses[idx].clone();
+    let new_message = responses[idx % responses.len()].clone();
 
     let mut data = data.lock().await;
     data.messages.push(new_message.clone());
