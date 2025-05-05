@@ -7,7 +7,7 @@ struct Data {
     messages: Vec<String>,
 }
 
-fn chat(req: Request) -> Response {
+async fn chat(req: Request) -> Response {
     let str = if let Request::Post(str) = req {
         str
     } else {
@@ -20,14 +20,16 @@ fn chat(req: Request) -> Response {
     Response::Ok(Content::Json(resp))
 }
 
-fn index(_req: Request) -> Response {
+async fn index(_req: Request) -> Response {
     let content = include_str!("../index.html").to_string();
     Ok(Content::Html(content))
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     miniserve::Server::new()
         .route("/", index)
         .route("/chat", chat)
         .run()
+        .await
 }
