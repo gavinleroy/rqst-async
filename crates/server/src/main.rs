@@ -1,7 +1,8 @@
+use std::sync::Arc;
+
 use miniserve::{http::StatusCode, Content, Request, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::join;
+use tokio::{join, sync::Mutex};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Data {
@@ -15,14 +16,25 @@ async fn chat(req: Request) -> Response {
         "".to_string()
     };
 
-    let mut data: Data = serde_json::from_str(&str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let data: Data = serde_json::from_str(&str).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let data = Arc::new(Mutex::new(data));
 
-    let messages = chatbot::query_chat(&data.messages);
-    let idx = chatbot::gen_random_number();
-    let (mut responses, idx) = join!(messages, idx);
-    let idx = idx % responses.len();
-    data.messages.push(std::mem::take(&mut responses[idx]));
-    let resp = json!(data).to_string();
+    let data2 = Arc::clone(&data);
+    let messages = tokio::spawn(async move {
+        let data = data2.lock().await;
+        chatbot::query_chat(&data.messages).await
+    });
+    let idx = tokio::spawn(chatbot::gen_random_number());
+
+    let (responses, idx) = join!(messages, idx);
+    let (responses, idx) = (responses.unwrap(), idx.unwrap());
+
+    let new_message = responses[idx % responses.len()].clone();
+
+    let mut data = data.lock().await;
+    data.messages.push(new_message.clone());
+
+    let resp = serde_json::to_string(&*data).unwrap();
     Response::Ok(Content::Json(resp))
 }
 
