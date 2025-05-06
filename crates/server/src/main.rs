@@ -7,33 +7,58 @@ use miniserve::{Content, Request, Response};
 use serde::{Deserialize, Serialize};
 use tokio::{join, sync::oneshot};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct Data {
+#[derive(Debug, Clone, Deserialize)]
+struct ChatData {
     messages: Vec<String>,
+}
+
+impl ChatData {
+    fn success(mut self, msg: String) -> ChatResponse {
+        self.messages.push(msg);
+        ChatResponse::Success {
+            messages: self.messages,
+        }
+    }
+
+    fn cancelled(self) -> ChatResponse {
+        ChatResponse::Cancelled
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum ChatResponse {
+    Cancelled,
+    Success { messages: Vec<String> },
 }
 
 async fn chat(req: Request) -> Response {
     let Request::Post(str) = req else { todo!() };
 
-    let data: Data = serde_json::from_str(&str).unwrap();
-    let mut data = Arc::new(data);
-
+    let data = Arc::new(serde_json::from_str(&str).unwrap());
     let data2 = Arc::clone(&data);
+
     let messages = tokio::spawn(async move { get_responses(data2).await });
     let idx = tokio::spawn(chatbot::gen_random_number());
 
     let (responses, idx) = join!(messages, idx);
-    let (responses, idx) = (responses.unwrap(), idx.unwrap());
 
-    let new_message = responses[idx % responses.len()].clone();
+    let unarc = |arc| Arc::into_inner(arc).unwrap();
+    let response = match responses.unwrap() {
+        ChatResponses::Cancelled => unarc(data).cancelled(),
+        ChatResponses::Messages(mut responses) => {
+            let l = responses.len();
+            let new_message = std::mem::take(&mut responses[idx.unwrap() % l]);
+            unarc(data).success(new_message)
+        }
+    };
 
-    Arc::get_mut(&mut data)
-        .unwrap()
-        .messages
-        .push(new_message.clone());
+    Ok(Content::Json(serde_json::to_string(&response).unwrap()))
+}
 
-    let resp = serde_json::to_string(&*data).unwrap();
-    Response::Ok(Content::Json(resp))
+async fn cancel(_req: Request) -> Response {
+    CHATBOT.1.send(()).await.unwrap();
+    Ok(Content::Json("".to_string()))
 }
 
 async fn index(_req: Request) -> Response {
@@ -41,42 +66,57 @@ async fn index(_req: Request) -> Response {
     Ok(Content::Html(content))
 }
 
-async fn get_responses(messages: Arc<Data>) -> Vec<String> {
-    type T = (Arc<Data>, oneshot::Sender<Vec<String>>);
-    static SEND: LazyLock<mpsc::Sender<T>> = LazyLock::new(|| {
-        let mut chatbot = Chatbot::new(vec![
-            "🫵".to_string(),
-            "🫠".to_string(),
-            "🤗".to_string(),
-            "🫡".to_string(),
-            "🤪".to_string(),
-        ]);
+#[derive(Debug, Clone)]
+enum ChatResponses {
+    Cancelled,
+    Messages(Vec<String>),
+}
 
-        let (tx, mut rx): (mpsc::Sender<T>, mpsc::Receiver<T>) = mpsc::channel(100);
-        tokio::spawn(async move {
-            while let Some((data, ret)) = rx.recv().await {
-                let messages: &[String] = &data.messages;
-                let fns = chatbot.retrieval_documents(messages);
+type QueryData = (Arc<ChatData>, oneshot::Sender<ChatResponses>);
 
-                let mut docs_maybe = fns
-                    .into_iter()
-                    .map(fs::read_to_string)
-                    .collect::<JoinSet<_>>();
-                let mut docs = vec![];
-                while let Some(doc) = docs_maybe.join_next().await {
-                    docs.push(doc.unwrap().unwrap());
-                }
+static CHATBOT: LazyLock<(mpsc::Sender<QueryData>, mpsc::Sender<()>)> = LazyLock::new(|| {
+    let mut chatbot = Chatbot::new(vec![
+        "🫵".to_string(),
+        "🫠".to_string(),
+        "🤗".to_string(),
+        "🫡".to_string(),
+        "🤪".to_string(),
+    ]);
 
-                let responses = chatbot.query_chat(messages, &docs).await;
-                ret.send(responses).unwrap();
+    let (tx, mut rx) = mpsc::channel::<QueryData>(100);
+    let (ctx, mut crx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        while let Some((data, ret)) = rx.recv().await {
+            let messages: &[String] = &data.messages;
+            let fns = chatbot.retrieval_documents(messages);
+
+            let mut docs_maybe = fns
+                .into_iter()
+                .map(fs::read_to_string)
+                .collect::<JoinSet<_>>();
+            let mut docs = vec![];
+            while let Some(doc) = docs_maybe.join_next().await {
+                docs.push(doc.unwrap().unwrap());
             }
-        });
 
-        tx
+            tokio::select! {
+                responses = chatbot.query_chat(messages, &docs) => {
+                    ret.send(ChatResponses::Messages(responses)).unwrap();
+                }
+                _ = crx.recv() => {
+                    ret.send(ChatResponses::Cancelled).unwrap();
+                }
+            }
+        }
     });
 
+    (tx, ctx)
+});
+
+async fn get_responses(messages: Arc<ChatData>) -> ChatResponses {
     let (tx, rx) = oneshot::channel();
-    SEND.send((messages, tx)).await.unwrap();
+    CHATBOT.0.send((messages, tx)).await.unwrap();
     rx.await.unwrap()
 }
 
@@ -85,6 +125,7 @@ async fn main() {
     miniserve::Server::new()
         .route("/", index)
         .route("/chat", chat)
+        .route("/cancel", cancel)
         .run()
         .await
 }
