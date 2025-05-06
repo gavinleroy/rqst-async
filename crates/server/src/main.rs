@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use miniserve::{http::StatusCode, Content, Request, Response};
+use tokio::sync::mpsc;
+
+use chatbot::Chatbot;
+use miniserve::{Content, Request, Response};
 use serde::{Deserialize, Serialize};
-use tokio::{join, sync::Mutex};
+use tokio::{join, sync::oneshot};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Data {
@@ -10,20 +13,13 @@ struct Data {
 }
 
 async fn chat(req: Request) -> Response {
-    let str = if let Request::Post(str) = req {
-        str
-    } else {
-        "".to_string()
-    };
+    let Request::Post(str) = req else { todo!() };
 
-    let data: Data = serde_json::from_str(&str).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let data = Arc::new(Mutex::new(data));
+    let data: Data = serde_json::from_str(&str).unwrap();
+    let mut data = Arc::new(data);
 
     let data2 = Arc::clone(&data);
-    let messages = tokio::spawn(async move {
-        let data = data2.lock().await;
-        chatbot::query_chat(&data.messages).await
-    });
+    let messages = tokio::spawn(async move { get_responses(data2).await });
     let idx = tokio::spawn(chatbot::gen_random_number());
 
     let (responses, idx) = join!(messages, idx);
@@ -31,8 +27,10 @@ async fn chat(req: Request) -> Response {
 
     let new_message = responses[idx % responses.len()].clone();
 
-    let mut data = data.lock().await;
-    data.messages.push(new_message.clone());
+    Arc::get_mut(&mut data)
+        .unwrap()
+        .messages
+        .push(new_message.clone());
 
     let resp = serde_json::to_string(&*data).unwrap();
     Response::Ok(Content::Json(resp))
@@ -41,6 +39,34 @@ async fn chat(req: Request) -> Response {
 async fn index(_req: Request) -> Response {
     let content = include_str!("../index.html").to_string();
     Ok(Content::Html(content))
+}
+
+async fn get_responses(messages: Arc<Data>) -> Vec<String> {
+    type T = (Arc<Data>, oneshot::Sender<Vec<String>>);
+    static SEND: LazyLock<mpsc::Sender<T>> = LazyLock::new(|| {
+        let mut chatbot = Chatbot::new(vec![
+            "🫵".to_string(),
+            "🫠".to_string(),
+            "🤗".to_string(),
+            "🫡".to_string(),
+            "🤪".to_string(),
+        ]);
+
+        let (tx, mut rx): (mpsc::Sender<T>, mpsc::Receiver<T>) = mpsc::channel(100);
+        tokio::spawn(async move {
+            while let Some((data, ret)) = rx.recv().await {
+                let messages: &[String] = &data.messages;
+                let responses = chatbot.query_chat(messages).await;
+                ret.send(responses).unwrap();
+            }
+        });
+
+        tx
+    });
+
+    let (tx, rx) = oneshot::channel();
+    SEND.send((messages, tx)).await.unwrap();
+    rx.await.unwrap()
 }
 
 #[tokio::main]
