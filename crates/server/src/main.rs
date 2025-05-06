@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
-use tokio::sync::mpsc;
+use tokio::{fs, sync::mpsc, task::JoinSet};
 
 use chatbot::Chatbot;
 use miniserve::{Content, Request, Response};
@@ -56,7 +56,18 @@ async fn get_responses(messages: Arc<Data>) -> Vec<String> {
         tokio::spawn(async move {
             while let Some((data, ret)) = rx.recv().await {
                 let messages: &[String] = &data.messages;
-                let responses = chatbot.query_chat(messages).await;
+                let fns = chatbot.retrieval_documents(messages);
+
+                let mut docs_maybe = fns
+                    .into_iter()
+                    .map(fs::read_to_string)
+                    .collect::<JoinSet<_>>();
+                let mut docs = vec![];
+                while let Some(doc) = docs_maybe.join_next().await {
+                    docs.push(doc.unwrap().unwrap());
+                }
+
+                let responses = chatbot.query_chat(messages, &docs).await;
                 ret.send(responses).unwrap();
             }
         });
