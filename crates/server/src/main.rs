@@ -2,7 +2,7 @@ use std::{
     future::Future,
     pin::pin,
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::{fs, select, task::JoinSet, time::sleep};
@@ -88,7 +88,7 @@ async fn chat(req: Request) -> Response {
 
     let (responses, idx, ()) = join!(
         get_responses(Arc::clone(&data)),
-        execute_timed(chatbot::gen_random_number()),
+        chatbot::gen_random_number(),
         log(Arc::clone(&data))
     );
 
@@ -120,7 +120,7 @@ async fn index(_req: Request) -> Response {
 
 async fn execute_timed<O>(f: impl Future<Output = O>) -> O {
     let mut fut = pin!(f);
-    let mut counter = 0;
+    let now = Instant::now();
     let one_sec = Duration::from_secs(1);
     loop {
         select! {
@@ -128,8 +128,7 @@ async fn execute_timed<O>(f: impl Future<Output = O>) -> O {
                 return o;
             }
             _ = sleep(one_sec) => {
-                counter += 1;
-                println!("Waiting {counter} secs");
+                println!("Waiting {} secs", now.elapsed().as_secs());
             }
         }
     }

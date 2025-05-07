@@ -1,6 +1,7 @@
-use std::{future::Future, pin::pin};
+use std::future::Future;
 
 use tokio::{
+    select,
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
@@ -25,13 +26,11 @@ impl<T: Task> Runner<T> {
         let (cx, mut cx_rx) = mpsc::channel(1);
         let handle = tokio::spawn(async move {
             while let Some((input, ret)) = rx.recv().await {
-                let mut f = pin!(task.run(input));
-                let mut c = pin!(cx_rx.recv());
-                tokio::select! {
-                    o = &mut f => {
+                select! {
+                    o = task.run(input) => {
                         let _ = ret.send(o);
                     },
-                    _ = &mut c => {},
+                    _ = cx_rx.recv() => {},
                 }
             }
         });
