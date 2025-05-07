@@ -1,6 +1,11 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    future::Future,
+    pin::pin,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
-use tokio::{fs, sync::mpsc, task::JoinSet};
+use tokio::{fs, select, sync::mpsc, task::JoinSet, time::sleep};
 
 use chatbot::Chatbot;
 use miniserve::{Content, Request, Response};
@@ -32,14 +37,31 @@ enum ChatResponse {
     Success { messages: Vec<String> },
 }
 
+async fn execute_timed<O>(f: impl Future<Output = O>) -> O {
+    let mut fut = pin!(f);
+    let mut counter = 0;
+    let one_sec = Duration::from_secs(1);
+    loop {
+        select! {
+            o = &mut fut => {
+                return o;
+            }
+            _ = sleep(one_sec) => {
+                counter += 1;
+                println!("Waiting {counter} secs");
+            }
+        }
+    }
+}
+
 async fn chat(req: Request) -> Response {
     let Request::Post(str) = req else { todo!() };
 
     let data = Arc::new(serde_json::from_str(&str).unwrap());
     let data2 = Arc::clone(&data);
 
-    let messages = tokio::spawn(async move { get_responses(data2).await });
-    let idx = tokio::spawn(chatbot::gen_random_number());
+    let messages = tokio::spawn(get_responses(data2));
+    let idx = tokio::spawn(execute_timed(chatbot::gen_random_number()));
 
     let (responses, idx) = join!(messages, idx);
 
@@ -57,7 +79,7 @@ async fn chat(req: Request) -> Response {
 }
 
 async fn cancel(_req: Request) -> Response {
-    CHATBOT.1.send(()).await.unwrap();
+    CHATBOT.cancel.send(()).await.unwrap();
     Ok(Content::Json("".to_string()))
 }
 
@@ -74,7 +96,12 @@ enum ChatResponses {
 
 type QueryData = (Arc<ChatData>, oneshot::Sender<ChatResponses>);
 
-static CHATBOT: LazyLock<(mpsc::Sender<QueryData>, mpsc::Sender<()>)> = LazyLock::new(|| {
+struct SendChannels {
+    responses: mpsc::Sender<QueryData>,
+    cancel: mpsc::Sender<()>,
+}
+
+static CHATBOT: LazyLock<SendChannels> = LazyLock::new(|| {
     let mut chatbot = Chatbot::new(vec![
         "🫵".to_string(),
         "🫠".to_string(),
@@ -100,23 +127,29 @@ static CHATBOT: LazyLock<(mpsc::Sender<QueryData>, mpsc::Sender<()>)> = LazyLock
                 docs.push(doc.unwrap().unwrap());
             }
 
+            let mut query_fut = pin!(execute_timed(chatbot.query_chat(messages, &docs)));
+            let mut cancel_fut = pin!(crx.recv());
+
             tokio::select! {
-                responses = chatbot.query_chat(messages, &docs) => {
+                responses = &mut query_fut  => {
                     ret.send(ChatResponses::Messages(responses)).unwrap();
                 }
-                _ = crx.recv() => {
+                _ = &mut cancel_fut  => {
                     ret.send(ChatResponses::Cancelled).unwrap();
                 }
             }
         }
     });
 
-    (tx, ctx)
+    SendChannels {
+        responses: tx,
+        cancel: ctx,
+    }
 });
 
 async fn get_responses(messages: Arc<ChatData>) -> ChatResponses {
     let (tx, rx) = oneshot::channel();
-    CHATBOT.0.send((messages, tx)).await.unwrap();
+    CHATBOT.responses.send((messages, tx)).await.unwrap();
     rx.await.unwrap()
 }
 
